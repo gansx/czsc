@@ -1,0 +1,174 @@
+name: Sync upstream (waditu/czsc)
+
+# 每周一自动跟上上游，也支持手动触发
+#
+# 设计要点：
+#   1. fetch-depth: 0 —— 必须完整历史，否则 merge 会变成 unrelated histories
+#   2. 冲突时不静默失败，开 issue 让人处理
+#   3. concurrency 防止两次同步撞车
+#   4. 同步 tag，但 fork 里的 publish workflow 已禁用（见 DISABLED_WORKFLOWS.md）
+
+on:
+  schedule:
+    # 每周一 02:00 UTC = 北京时间 10:00
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      sync_tags:
+        description: '同时同步上游 tag'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+  actions: write          # 用于同步后重新禁用上游 workflow
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/waditu/czsc.git 2>/dev/null || true
+          git fetch upstream master --force
+          if [ "${{ inputs.sync_tags }}" != "false" ]; then
+            git fetch upstream --tags --force || true
+          fi
+
+      - name: Detect drift
+        id: drift
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/master)
+          echo "local  = $LOCAL"
+          echo "remote = $REMOTE"
+
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            echo "up to date" 
+          else
+            BEHIND=$(git rev-list --count HEAD..upstream/master)
+            AHEAD=$(git rev-list --count upstream/master..HEAD)
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "ahead_count=$AHEAD"  >> "$GITHUB_OUTPUT"
+            echo "上游有 $BEHIND 个新提交，本地领先 $AHEAD 个"
+          fi
+
+      - name: Merge upstream/master
+        id: merge
+        if: steps.drift.outputs.behind == 'true'
+        run: |
+          if git merge --no-edit upstream/master; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            echo "merge 成功"
+          else
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            echo "merge 冲突，已回滚"
+          fi
+
+      - name: Push
+        if: steps.drift.outputs.behind == 'true' && steps.merge.outputs.result == 'ok'
+        run: |
+          git push origin master
+          if [ "${{ inputs.sync_tags }}" != "false" ]; then
+            # 只推上游已有的 tag，不推本地新建的
+            git push origin --tags --force-with-lease || git push origin --tags || true
+          fi
+
+      - name: Re-disable upstream workflows
+        if: steps.merge.outputs.result == 'ok'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 上游带来的 workflow 在 fork 里会跑失败（缺 token / 缺 secret），同步后重新禁用
+          for wf in code-quality.yml python-publish.yml rust-publish.yml claude.yml; do
+            ID=$(gh api "repos/${{ github.repository }}/actions/workflows" \
+                  --jq ".workflows[] | select(.path==\".github/workflows/$wf\") | .id" 2>/dev/null)
+            if [ -n "$ID" ]; then
+              gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$ID/disable" \
+                --silent && echo "disabled $wf (id=$ID)" || echo "skip $wf"
+            fi
+          done
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.result == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `上游同步冲突 ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## 自动同步遇到冲突，已回滚，fork 未变更',
+              '',
+              `上游 \`waditu/czsc\` 有 **${process.env.BEHIND}** 个新提交，\`git merge\` 失败。`,
+              '',
+              '### 处理步骤',
+              '```bash',
+              'git clone https://github.com/' + process.env.REPO + '.git',
+              'cd czsc',
+              'git remote add upstream https://github.com/waditu/czsc.git 2>/dev/null || true',
+              'git fetch upstream',
+              'git merge upstream/master',
+              '# 解决冲突后',
+              'git push origin master',
+              '```',
+              '',
+              '> 冲突通常来自 `.github/workflows/` 下的文件被双方都改过。',
+              '> 若冲突集中在 workflow 文件，可直接取上游版本：`git checkout --theirs .github/workflows/`',
+            ].join('\n');
+
+            // 已有同类 open issue 就不重复开
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'upstream-sync'
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: `再次冲突 @ ${new Date().toISOString()}`
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title, body, labels: ['upstream-sync']
+            });
+        env:
+          BEHIND: ${{ steps.drift.outputs.behind_count }}
+          REPO: ${{ github.repository }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游新提交 | ${{ steps.drift.outputs.behind_count || '0' }} |"
+            echo "| 本地领先 | ${{ steps.drift.outputs.ahead_count || '0' }} |"
+            echo "| merge 结果 | ${{ steps.merge.outputs.result || 'n/a' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
