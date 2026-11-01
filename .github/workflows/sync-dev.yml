@@ -1,0 +1,151 @@
+name: Sync dev from master
+
+# master 跟随上游更新后，自动把 dev 分支也推上去
+#
+# 用 workflow_run 而不是 push 触发：sync-upstream 用的是 GITHUB_TOKEN，
+# 它触发的 push 不会级联触发其他 workflow（GitHub 防递归），
+# 而 workflow_run 不受这个限制。
+
+on:
+  workflow_run:
+    workflows: ["Sync upstream (waditu/czsc)"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-dev
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge master into dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v5
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect drift
+        id: drift
+        run: |
+          git fetch origin master --force
+          LOCAL=$(git rev-parse HEAD)
+          MASTER=$(git rev-parse origin/master)
+          echo "dev    = $LOCAL"
+          echo "master = $MASTER"
+
+          if [ "$LOCAL" = "$MASTER" ]; then
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            echo "dev 与 master 一致"
+          else
+            BEHIND=$(git rev-list --count HEAD..origin/master)
+            AHEAD=$(git rev-list --count origin/master..HEAD)
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "ahead_count=$AHEAD"  >> "$GITHUB_OUTPUT"
+            echo "master 领先 $BEHIND，dev 领先 $AHEAD"
+          fi
+
+      - name: Merge master
+        id: merge
+        if: steps.drift.outputs.behind == 'true'
+        run: |
+          if git merge --no-edit origin/master; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            echo "merge 成功"
+          else
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            echo "merge 冲突，已回滚"
+          fi
+
+      - name: Push dev
+        if: steps.drift.outputs.behind == 'true' && steps.merge.outputs.result == 'ok'
+        run: git push origin dev
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.result == 'conflict'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const title = `dev 与 master 冲突 @ ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## `dev` 自动跟随 `master` 时遇到冲突，已回滚',
+              '',
+              '这意味着你在 `dev` 上的改动和上游更新撞车了。',
+              '',
+              '### 处理步骤',
+              '```bash',
+              'git clone https://github.com/' + process.env.REPO + '.git',
+              'cd czsc',
+              'git checkout dev',
+              'git fetch origin master',
+              'git merge origin/master',
+              '# 解决冲突',
+              'git push origin dev',
+              '```',
+              '',
+              '### 如果不想处理冲突',
+              '',
+              '把 `dev` 重置到 `master`（**会丢弃 dev 上的改动**）：',
+              '```bash',
+              'git checkout dev',
+              'git reset --hard origin/master',
+              'git push --force origin dev',
+              '```',
+              '',
+              '或改用"只挑我的改动"策略：',
+              '```bash',
+              'git checkout -b dev2 origin/master',
+              'git cherry-pick <你的 commit>',
+              '```',
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'dev-sync'
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: `再次冲突 @ ${new Date().toISOString()}`
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title, body, labels: ['dev-sync']
+            });
+        env:
+          REPO: ${{ github.repository }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### dev ← master 同步"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| master 领先 | ${{ steps.drift.outputs.behind_count || '0' }} |"
+            echo "| dev 领先 | ${{ steps.drift.outputs.ahead_count || '0' }} |"
+            echo "| merge | ${{ steps.merge.outputs.result || 'n/a' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
